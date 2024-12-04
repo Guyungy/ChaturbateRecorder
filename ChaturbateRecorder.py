@@ -8,41 +8,45 @@ import streamlink
 import subprocess
 import queue
 import requests
+from pathlib import Path
 
 if os.name == 'nt':
     import ctypes
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
-mainDir = sys.path[0]
+mainDir = Path(sys.path[0])
 Config = configparser.ConfigParser()
 setting = {}
 
 recording = []
-
 hilos = []
+
 
 def cls():
     os.system('cls' if os.name == 'nt' else 'clear')
-    
+
+
 def readConfig():
     global setting
 
-    Config.read(mainDir + '/config.conf')
+    Config.read(mainDir / 'config.conf')
     setting = {
         'save_directory': Config.get('paths', 'save_directory'),
         'wishlist': Config.get('paths', 'wishlist'),
         'interval': int(Config.get('settings', 'checkInterval')),
         'postProcessingCommand': Config.get('settings', 'postProcessingCommand'),
-        }
+    }
     try:
         setting['postProcessingThreads'] = int(Config.get('settings', 'postProcessingThreads'))
     except ValueError:
         if setting['postProcessingCommand'] and not setting['postProcessingThreads']:
             setting['postProcessingThreads'] = 1
-    
-    if not os.path.exists(f'{setting["save_directory"]}'):
-        os.makedirs(f'{setting["save_directory"]}')
+
+    save_path = Path(setting["save_directory"])
+    if not save_path.exists():
+        save_path.mkdir(parents=True)
+
 
 def postProcess():
     while True:
@@ -54,7 +58,12 @@ def postProcess():
         filename = os.path.split(path)[-1]
         directory = os.path.dirname(path)
         file = os.path.splitext(filename)[0]
-        subprocess.call(setting['postProcessingCommand'].split() + [path, filename, directory, model,  file, 'cam4'])
+        try:
+            subprocess.run(setting['postProcessingCommand'].split() + [path, filename, directory, model, file, 'cam4'], check=True)
+        except subprocess.CalledProcessError as e:
+            with open('log.log', 'a+') as f:
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} POST-PROCESS ERROR: {e}\n')
+
 
 class Modelo(threading.Thread):
     def __init__(self, modelo):
@@ -68,35 +77,37 @@ class Modelo(threading.Thread):
     def run(self):
         global recording, hilos
         isOnline = self.isOnline()
-        if isOnline == False:
+        if not isOnline:
             self.online = False
         else:
             self.online = True
-            self.file = os.path.join(setting['save_directory'], self.modelo, f'{datetime.datetime.fromtimestamp(time.time()).strftime("%Y.%m.%d_%H.%M.%S")}_{self.modelo}.mp4')
+            self.file = Path(setting['save_directory']) / self.modelo / f'{datetime.datetime.fromtimestamp(time.time()).strftime("%Y.%m.%d_%H.%M.%S")}_{self.modelo}.mp4'
             try:
                 session = streamlink.Streamlink()
                 streams = session.streams(f'hlsvariant://{isOnline}')
+                if 'best' not in streams:
+                    raise ValueError("No suitable stream found for the model.")
                 stream = streams['best']
-                fd = stream.open()
-                if not isModelInListofObjects(self.modelo, recording):
-                    os.makedirs(os.path.join(setting['save_directory'], self.modelo), exist_ok=True)
-                    with open(self.file, 'wb') as f:
-                        self.lock.acquire()
-                        recording.append(self)
-                        for index, hilo in enumerate(hilos):
-                            if hilo.modelo == self.modelo:
-                                del hilos[index]
+                with stream.open() as fd, open(self.file, 'wb') as f:
+                    self.lock.acquire()
+                    recording.append(self)
+                    for index, hilo in enumerate(hilos):
+                        if hilo.modelo == self.modelo:
+                            del hilos[index]
+                            break
+                    self.lock.release()
+                    while not (self._stopevent.isSet() or os.fstat(f.fileno()).st_nlink == 0):
+                        try:
+                            data = fd.read(1024)
+                            if not data:
                                 break
-                        self.lock.release()
-                        while not (self._stopevent.isSet() or os.fstat(f.fileno()).st_nlink == 0):
-                            try:
-                                data = fd.read(1024)
-                                f.write(data)
-                            except:
-                                fd.close()
-                                break
-                    if setting['postProcessingCommand']:
-                            processingQueue.put({'model': self.modelo, 'path': self.file})
+                            f.write(data)
+                        except Exception as e:
+                            with open('log.log', 'a+') as log_file:
+                                log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} STREAM ERROR: {e}\n')
+                            break
+                if setting['postProcessingCommand']:
+                    processingQueue.put({'model': self.modelo, 'path': str(self.file)})
             except Exception as e:
                 with open('log.log', 'a+') as f:
                     f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} EXCEPTION: {e}\n')
@@ -114,10 +125,9 @@ class Modelo(threading.Thread):
                 break
         self.lock.release()
         try:
-            file = os.path.join(os.getcwd(), self.file)
-            if os.path.isfile(file):
-                if os.path.getsize(file) <= 1024:
-                    os.remove(file)
+            file = Path(self.file)
+            if file.is_file() and file.stat().st_size <= 1024:
+                file.unlink()
         except Exception as e:
             with open('log.log', 'a+') as f:
                 f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} EXCEPTION: {e}\n')
@@ -125,38 +135,35 @@ class Modelo(threading.Thread):
     def isOnline(self):
         try:
             resp = requests.get(f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/')
-            hls_url = ''
             if 'hls_source' in resp.json():
-                hls_url = resp.json()['hls_source']
-            if len(hls_url):
-                return hls_url
+                return resp.json()['hls_source']
             else:
                 return False
-        except:
+        except Exception as e:
+            with open('log.log', 'a+') as f:
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} IS-ONLINE CHECK ERROR: {e}\n')
             return False
 
     def stop(self):
         self._stopevent.set()
+
 
 class CleaningThread(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
         self.interval = 0
         self.lock = threading.Lock()
-        
+
     def run(self):
         global hilos, recording
         while True:
             self.lock.acquire()
-            new_hilos = []
-            for hilo in hilos:
-                if hilo.is_alive() or hilo.online:
-                    new_hilos.append(hilo)
-            hilos = new_hilos
+            hilos = [hilo for hilo in hilos if hilo.is_alive() or hilo.online]
             self.lock.release()
             for i in range(10, 0, -1):
                 self.interval = i
                 time.sleep(1)
+
 
 class AddModelsThread(threading.Thread):
     def __init__(self):
@@ -168,17 +175,16 @@ class AddModelsThread(threading.Thread):
 
     def run(self):
         global hilos, recording
-        lines = open(setting['wishlist'], 'r').read().splitlines()
-        self.wanted = (x for x in lines if x)
+        lines = Path(setting['wishlist']).read_text().splitlines()
+        self.wanted = [x.lower() for x in lines if x]
         self.lock.acquire()
         aux = []
         for model in self.wanted:
-            model = model.lower()
             if model in aux:
                 self.repeatedModels.append(model)
             else:
                 aux.append(model)
-                self.counterModel = self.counterModel + 1
+                self.counterModel += 1
                 if not isModelInListofObjects(model, hilos) and not isModelInListofObjects(model, recording):
                     thread = Modelo(model)
                     thread.start()
@@ -188,22 +194,17 @@ class AddModelsThread(threading.Thread):
                 hilo.stop()
         self.lock.release()
 
+
 def isModelInListofObjects(obj, lista):
-    result = False
-    for i in lista:
-        if i.modelo == obj:
-            result = True
-            break
-    return result
+    return any(i.modelo == obj for i in lista)
+
 
 if __name__ == '__main__':
     readConfig()
     if setting['postProcessingCommand']:
         processingQueue = queue.Queue()
-        postprocessingWorkers = []
-        for i in range(0, setting['postProcessingThreads']):
-            t = threading.Thread(target=postProcess)
-            postprocessingWorkers.append(t)
+        postprocessingWorkers = [threading.Thread(target=postProcess) for _ in range(setting['postProcessingThreads'])]
+        for t in postprocessingWorkers:
             t.start()
     cleaningThread = CleaningThread()
     cleaningThread.start()
@@ -212,17 +213,19 @@ if __name__ == '__main__':
             readConfig()
             addModelsThread = AddModelsThread()
             addModelsThread.start()
-            i = 1
             for i in range(setting['interval'], 0, -1):
                 cls()
-                if len(addModelsThread.repeatedModels): print('The following models are more than once in wanted: [\'' + ', '.join(modelo for modelo in addModelsThread.repeatedModels) + '\']')
+                if addModelsThread.repeatedModels:
+                    print('The following models are more than once in wanted: [\'' + ', '.join(model for model in addModelsThread.repeatedModels) + '\']')
                 print(f'{len(hilos):02d} alive Threads (1 Thread per non-recording model), cleaning dead/not-online Threads in {cleaningThread.interval:02d} seconds, {addModelsThread.counterModel:02d} models in wanted')
                 print(f'Online Threads (models): {len(recording):02d}')
                 print('The following models are being recorded:')
-                for hiloModelo in recording: print(f'  Model: {hiloModelo.modelo}  -->  File: {os.path.basename(hiloModelo.file)}')
+                for hiloModelo in recording:
+                    print(f'  Model: {hiloModelo.modelo}  -->  File: {os.path.basename(hiloModelo.file)}')
                 print(f'Next check in {i:02d} seconds\r', end='')
                 time.sleep(1)
             addModelsThread.join()
-            del addModelsThread, i
-        except:
+        except Exception as e:
+            with open('log.log', 'a+') as f:
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} MAIN LOOP ERROR: {e}\n')
             break
