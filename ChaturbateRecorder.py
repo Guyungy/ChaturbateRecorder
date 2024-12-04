@@ -1,7 +1,6 @@
 import time
 import datetime
 import os
-import threading
 import sys
 import configparser
 import streamlink
@@ -9,6 +8,7 @@ import subprocess
 import queue
 import requests
 from pathlib import Path
+import threading
 
 if os.name == 'nt':
     import ctypes
@@ -33,22 +33,48 @@ def cls():
 def readConfig():
     global setting
 
-    Config.read(mainDir / 'config.conf')
-    setting = {
-        'save_directory': Config.get('paths', 'save_directory'),
-        'wishlist': Config.get('paths', 'wishlist'),
-        'interval': int(Config.get('settings', 'checkInterval')),
-        'postProcessingCommand': Config.get('settings', 'postProcessingCommand'),
-    }
-    try:
-        setting['postProcessingThreads'] = int(Config.get('settings', 'postProcessingThreads'))
-    except ValueError:
-        if setting['postProcessingCommand'] and not setting['postProcessingThreads']:
-            setting['postProcessingThreads'] = 1
+    config_path = mainDir / 'config.conf'
+    if not config_path.exists():
+        print("配置文件 config.conf 不存在。请确保配置文件位于脚本所在目录。")
+        sys.exit(1)
 
+    Config.read(config_path)
+
+    try:
+        setting = {
+            'save_directory': Config.get('paths', 'save_directory'),
+            'wishlist': Config.get('paths', 'wishlist'),
+            'interval': int(Config.get('settings', 'checkInterval')),
+            'postProcessingCommand': Config.get('settings', 'postProcessingCommand'),
+            'genders': [gender.strip().lower() for gender in Config.get('settings', 'genders').split(',')],
+            'username': Config.get('login', 'username'),
+            'password': Config.get('login', 'password')
+        }
+        setting['postProcessingThreads'] = int(Config.get('settings', 'postProcessingThreads')) if Config.get('settings', 'postProcessingThreads') else 1
+    except (configparser.NoSectionError, configparser.NoOptionError, ValueError) as e:
+        print(f"配置文件错误: {e}")
+        sys.exit(1)
+
+    # 检查用户名和密码
+    if not setting['username'] or not setting['password']:
+        print("用户名或密码未设置。请在配置文件的 [login] 部分填写 username 和 password。")
+        sys.exit(1)
+
+    # 检查 wishlist 文件是否存在
+    wishlist_path = Path(setting['wishlist'])
+    if not wishlist_path.exists():
+        print(f"wishlist 文件不存在: {wishlist_path}")
+        sys.exit(1)
+
+    # 创建保存目录
     save_path = Path(setting["save_directory"])
     if not save_path.exists():
-        save_path.mkdir(parents=True)
+        try:
+            save_path.mkdir(parents=True, exist_ok=True)
+            print(f"已创建保存目录: {save_path}")
+        except Exception as e:
+            print(f"无法创建保存目录 {save_path}: {e}")
+            sys.exit(1)
 
 # 后处理函数
 def postProcess():
@@ -56,7 +82,7 @@ def postProcess():
         try:
             parameters = processingQueue.get(timeout=1)
             if parameters is None:
-                break  # Stop the thread
+                break  # 停止线程
             model = parameters['model']
             path = parameters['path']
             filename = os.path.split(path)[-1]
@@ -66,7 +92,7 @@ def postProcess():
                 subprocess.run(setting['postProcessingCommand'].split() + [path, filename, directory, model, file, 'cam4'], check=True)
             except subprocess.CalledProcessError as e:
                 with open('log.log', 'a+') as f:
-                    f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} POST-PROCESS ERROR: {e}\n')
+                    f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 后处理错误: {e}\n')
         except queue.Empty:
             continue
 
@@ -84,48 +110,56 @@ class Modelo(threading.Thread):
 
     def run(self):
         global recording, hilos
-        isOnline = self.isOnline()
-        if not isOnline:
-            self.online = False
-        else:
-            self.online = True
-            model_dir = Path(setting['save_directory']) / self.modelo
-            model_dir.mkdir(parents=True, exist_ok=True)
-            self.file = model_dir / f'{datetime.datetime.fromtimestamp(time.time()).strftime("%Y.%m.%d_%H.%M.%S")}_{self.modelo}.ts'
-            try:
-                self.session = streamlink.Streamlink()
-                streams = self.session.streams(f'hlsvariant://{isOnline}')
-                if 'best' not in streams:
-                    raise ValueError("No suitable stream found for the model.")
-                self.stream = streams['best']
-                with self.stream.open() as fd, open(self.file, 'wb') as f:
-                    self.lock.acquire()
-                    recording.append(self)
-                    for index, hilo in enumerate(hilos):
-                        if hilo.modelo == self.modelo:
-                            del hilos[index]
-                            break
-                    self.lock.release()
-                    while not (self._stopevent.is_set() or shutdown_event.is_set() or os.fstat(f.fileno()).st_nlink == 0):
-                        if self._stopevent.is_set() or shutdown_event.is_set():
-                            break
-                        try:
-                            data = fd.read(1024)
-                            if not data:
+        while not shutdown_event.is_set() and not self._stopevent.is_set():
+            isOnline = self.isOnline()
+            if not isOnline:
+                self.online = False
+                time.sleep(10)  # 等待一段时间后重新检查
+                continue
+            else:
+                self.online = True
+                model_dir = Path(setting['save_directory']) / self.modelo
+                model_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.datetime.fromtimestamp(time.time()).strftime("%Y.%m.%d_%H.%M.%S")
+                self.file = model_dir / f'{timestamp}_{self.modelo}.ts'
+                try:
+                    self.session = streamlink.Streamlink()
+                    streams = self.session.streams(f'hlsvariant://{isOnline}')
+                    if 'best' not in streams:
+                        raise ValueError("未找到适合的流。")
+                    self.stream = streams['best']
+                    with self.stream.open() as fd, open(self.file, 'wb') as f:
+                        self.lock.acquire()
+                        recording.append(self)
+                        for index, hilo in enumerate(hilos):
+                            if hilo.modelo == self.modelo:
+                                del hilos[index]
                                 break
-                            f.write(data)
-                        except Exception as e:
-                            with open('log.log', 'a+') as log_file:
-                                log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} STREAM ERROR: {e}\n')
-                            break
-                if setting['postProcessingCommand']:
-                    processingQueue.put({'model': self.modelo, 'path': str(self.file)})
-            except Exception as e:
-                with open('log.log', 'a+') as f:
-                    f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} EXCEPTION: {e}\n')
-                self.stop()
-            finally:
-                self.exceptionHandler()
+                        self.lock.release()
+                        start_time = time.time()
+                        while not (self._stopevent.is_set() or shutdown_event.is_set() or os.fstat(f.fileno()).st_nlink == 0):
+                            current_time = time.time()
+                            elapsed = current_time - start_time
+                            if elapsed >= 1800:  # 30分钟 = 1800秒
+                                print(f"模型 {self.modelo} 已录制30分钟，正在停止并保存文件。")
+                                break
+                            try:
+                                data = fd.read(1024)
+                                if not data:
+                                    break
+                                f.write(data)
+                            except Exception as e:
+                                with open('log.log', 'a+') as log_file:
+                                    log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 流错误: {e}\n')
+                                break
+                    if setting['postProcessingCommand']:
+                        processingQueue.put({'model': self.modelo, 'path': str(self.file)})
+                except Exception as e:
+                    with open('log.log', 'a+') as f:
+                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 异常: {e}\n')
+                    self.stop()
+                finally:
+                    self.exceptionHandler()
 
     def exceptionHandler(self):
         self.stop()
@@ -140,7 +174,7 @@ class Modelo(threading.Thread):
                 file.unlink()
         except Exception as e:
             with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} EXCEPTION: {e}\n')
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 异常: {e}\n')
         finally:
             # 显式关闭会话，以确保后台任务停止
             if self.stream:
@@ -148,13 +182,13 @@ class Modelo(threading.Thread):
                     self.stream.close()
                 except Exception as e:
                     with open('log.log', 'a+') as f:
-                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} STREAM CLOSE ERROR: {e}\n')
+                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 流关闭错误: {e}\n')
             if self.session:
                 try:
                     self.session.close()
                 except Exception as e:
                     with open('log.log', 'a+') as f:
-                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} SESSION CLOSE ERROR: {e}\n')
+                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 会话关闭错误: {e}\n')
                 self.session = None
 
     def isOnline(self):
@@ -166,7 +200,7 @@ class Modelo(threading.Thread):
                 return False
         except Exception as e:
             with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} IS-ONLINE CHECK ERROR: {e}\n')
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 在线检查错误: {e}\n')
             return False
 
     def stop(self):
@@ -184,7 +218,7 @@ class Modelo(threading.Thread):
                         os.remove(self.file)
         except Exception as e:
             with open('log.log', 'a+') as log_file:
-                log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} STOP ERROR: {e}\n')
+                log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 停止错误: {e}\n')
 
 class CleaningThread(threading.Thread):
     def __init__(self):
@@ -261,17 +295,17 @@ if __name__ == '__main__':
                     break
                 cls()
                 if addModelsThread.repeatedModels:
-                    print('The following models are more than once in wanted: [' + ', '.join(model for model in addModelsThread.repeatedModels) + ']')
-                print(f'{len(hilos):02d} alive Threads (1 Thread per non-recording model), cleaning dead/not-online Threads in {cleaningThread.interval:02d} seconds, {addModelsThread.counterModel:02d} models in wanted')
-                print(f'Online Threads (models): {len(recording):02d}')
-                print('The following models are being recorded:')
+                    print('以下模型在愿望列表中出现多次: [' + ', '.join(model for model in addModelsThread.repeatedModels) + ']')
+                print(f'{len(hilos):02d} 个活跃线程（每个非录制模型一个线程），在 {cleaningThread.interval:02d} 秒内清理死线程或非在线线程，愿望列表中有 {addModelsThread.counterModel:02d} 个模型')
+                print(f'在线线程（模型）: {len(recording):02d}')
+                print('以下模型正在被录制:')
                 for hiloModelo in recording:
-                    print(f'  Model: {hiloModelo.modelo}  -->  File: {os.path.basename(hiloModelo.file)}')
-                print(f'Next check in {i:02d} seconds\r', end='')
+                    print(f'  模型: {hiloModelo.modelo}  -->  文件: {os.path.basename(hiloModelo.file)}')
+                print(f'下次检查将在 {i:02d} 秒后进行\r', end='')
                 time.sleep(1)
             addModelsThread.join()
     except KeyboardInterrupt:
-        print("\nGracefully shutting down...")
+        print("\n正在优雅地关闭...")
         shutdown_event.set()  # 设置全局关闭事件
 
         # 停止所有 Modelo 线程
@@ -284,7 +318,7 @@ if __name__ == '__main__':
         cleaningThread.join()
 
         # 停止 AddModelsThread 如果它还在运行
-        if addModelsThread.is_alive():
+        if 'addModelsThread' in locals() and addModelsThread.is_alive():
             addModelsThread.join()
 
         # 停止 post-processing workers
@@ -299,4 +333,4 @@ if __name__ == '__main__':
         sys.exit(0)
     except Exception as e:
         with open('log.log', 'a+') as f:
-            f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} MAIN LOOP ERROR: {e}\n')
+            f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 主循环错误: {e}\n')
