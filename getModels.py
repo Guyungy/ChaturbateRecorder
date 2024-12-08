@@ -22,19 +22,25 @@ def get_online_models(page, gender):
     while attempt <= 3:
         try:
             URL = f"https://chaturbate.com/{gender}-cams/?page={page}"
-            result = requests.get(URL, timeout=8)
+            result = requests.get(URL, timeout=8, verify=False)  # 添加 verify=False 参数绕过 SSL 验证
             result.raise_for_status()
             soup = BeautifulSoup(result.text, 'lxml')
             # 更新最后一页的信息
             if lastPage[gender] == 100:
-                lastPage[gender] = int(soup.findAll('a', {'class': 'endless_page_link'})[-2].string)
+                endless_links = soup.findAll('a', {'class': 'endless_page_link'})
+                if len(endless_links) >= 2:
+                    lastPage[gender] = int(endless_links[-2].string)
+                else:
+                    lastPage[gender] = page
             # 检查当前页是否是请求的页面
-            if int(soup.findAll('li', {'class': 'active'})[1].string) == page:
-                LIST = soup.findAll('ul', {'class': 'list'})[0]
-                models = LIST.find_all('div', {'class': 'title'})
-                return [model.find_all('a', href=True)[0].string.lower()[1:] for model in models]
+            active_page = soup.findAll('li', {'class': 'active'})
+            if len(active_page) >= 2 and int(active_page[1].string) == page:
+                LIST = soup.findAll('ul', {'class': 'list'})
+                if LIST:
+                    models = LIST[0].find_all('div', {'class': 'title'})
+                    return [model.find_all('a', href=True)[0].string.lower()[1:] for model in models]
             break
-        except (requests.exceptions.RequestException, IndexError) as e:
+        except (requests.exceptions.RequestException, IndexError, ValueError) as e:
             print(f"Attempt {attempt} failed for gender {gender} page {page}: {e}")
             attempt += 1
     return []

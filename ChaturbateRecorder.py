@@ -196,25 +196,47 @@ class Modelo(threading.Thread):
 
     def isOnline(self):
         try:
+            # 添加请求头（可选，根据需要）
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)\
+                 Chrome/58.0.3029.110 Safari/537.3'
+            }
+
             # 临时绕过 SSL 验证（不推荐）
             resp = requests.get(
                 f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/',
+                headers=headers,
                 verify=False  # 添加此参数绕过 SSL 验证
             )
-            # 如果需要，也可以使用 certifi 提供的证书
-            # resp = requests.get(
-            #     f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/',
-            #     verify=certifi.where()
-            # )
+            print(f"响应状态码: {resp.status_code}")
+            print(f"响应内容: {resp.text[:200]}")  # 只打印前200个字符
+
+            # 尝试解析 JSON
             data = resp.json()
             print(f"检查模型 {self.modelo} 的在线状态: {data}")
             if 'hls_source' in data:
                 return data['hls_source']
             else:
                 return False
-        except Exception as e:
+        except ValueError as ve:
+            # JSON 解析错误
             with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 在线检查错误: {e}\n')
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} JSON 解析错误: {ve}\n')
+            return False
+        except requests.exceptions.SSLError as ssl_err:
+            # SSL 错误
+            with open('log.log', 'a+') as f:
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} SSL 错误: {ssl_err}\n')
+            return False
+        except requests.exceptions.RequestException as req_err:
+            # 其他请求错误
+            with open('log.log', 'a+') as f:
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 请求错误: {req_err}\n')
+            return False
+        except Exception as e:
+            # 其他未预料的错误
+            with open('log.log', 'a+') as f:
+                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 其他错误: {e}\n')
             return False
 
     def stop(self):
