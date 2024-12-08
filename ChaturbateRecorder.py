@@ -9,6 +9,7 @@ import queue
 import requests
 from pathlib import Path
 import threading
+import certifi  # 确保已安装 certifi
 
 if os.name == 'nt':
     import ctypes
@@ -110,14 +111,16 @@ class Modelo(threading.Thread):
 
     def run(self):
         global recording, hilos
+        print(f"启动模型线程: {self.modelo}")
         while not shutdown_event.is_set() and not self._stopevent.is_set():
             isOnline = self.isOnline()
             if not isOnline:
+                print(f"模型 {self.modelo} 不在线")
                 self.online = False
                 time.sleep(10)  # 等待一段时间后重新检查
                 continue
             else:
-                self.online = True
+                print(f"模型 {self.modelo} 在线，开始录制")
                 model_dir = Path(setting['save_directory']) / self.modelo
                 model_dir.mkdir(parents=True, exist_ok=True)
                 timestamp = datetime.datetime.fromtimestamp(time.time()).strftime("%Y.%m.%d_%H.%M.%S")
@@ -193,9 +196,20 @@ class Modelo(threading.Thread):
 
     def isOnline(self):
         try:
-            resp = requests.get(f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/')
-            if 'hls_source' in resp.json():
-                return resp.json()['hls_source']
+            # 临时绕过 SSL 验证（不推荐）
+            resp = requests.get(
+                f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/',
+                verify=False  # 添加此参数绕过 SSL 验证
+            )
+            # 如果需要，也可以使用 certifi 提供的证书
+            # resp = requests.get(
+            #     f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/',
+            #     verify=certifi.where()
+            # )
+            data = resp.json()
+            print(f"检查模型 {self.modelo} 的在线状态: {data}")
+            if 'hls_source' in data:
+                return data['hls_source']
             else:
                 return False
         except Exception as e:
