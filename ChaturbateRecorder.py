@@ -9,7 +9,8 @@ import queue
 import requests
 from pathlib import Path
 import threading
-import certifi  # 确保已安装 certifi
+import certifi
+import random
 
 if os.name == 'nt':
     import ctypes
@@ -19,354 +20,175 @@ if os.name == 'nt':
 mainDir = Path(sys.path[0])
 Config = configparser.ConfigParser()
 setting = {}
-
-recording = []
-hilos = []
-
-# 全局关闭事件
 shutdown_event = threading.Event()
 
-# 清屏函数
-def cls():
-    os.system('cls' if os.name == 'nt' else 'clear')
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36',
+]
 
-# 读取配置文件
 def readConfig():
     global setting
-
     config_path = mainDir / 'config.conf'
+
     if not config_path.exists():
-        print("配置文件 config.conf 不存在。请确保配置文件位于脚本所在目录。")
+        print("配置文件 config.conf 不存在。")
         sys.exit(1)
 
-    Config.read(config_path)
-
     try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            Config.read_file(f)
+
         setting = {
             'save_directory': Config.get('paths', 'save_directory'),
             'wishlist': Config.get('paths', 'wishlist'),
-            'interval': int(Config.get('settings', 'checkInterval')),
-            'postProcessingCommand': Config.get('settings', 'postProcessingCommand'),
+            'interval': Config.getint('settings', 'checkInterval'),
+            'postProcessingCommand': Config.get('settings', 'postProcessingCommand', fallback=''),
             'genders': [gender.strip().lower() for gender in Config.get('settings', 'genders').split(',')],
             'username': Config.get('login', 'username'),
-            'password': Config.get('login', 'password')
+            'password': Config.get('login', 'password'),
+            'postProcessingThreads': Config.getint('settings', 'postProcessingThreads', fallback=1),
+            'completed_directory': Config.get('paths', 'completed_directory', fallback=''),
+            'proxy': Config.get('settings', 'proxy', fallback=''),
+            'max_concurrent': Config.getint('settings', 'max_concurrent', fallback=5)
         }
-        setting['postProcessingThreads'] = int(Config.get('settings', 'postProcessingThreads')) if Config.get('settings', 'postProcessingThreads') else 1
     except (configparser.NoSectionError, configparser.NoOptionError, ValueError) as e:
         print(f"配置文件错误: {e}")
         sys.exit(1)
-
-    # 检查用户名和密码
-    if not setting['username'] or not setting['password']:
-        print("用户名或密码未设置。请在配置文件的 [login] 部分填写 username 和 password。")
+    except UnicodeDecodeError as e:
+        print(f"编码错误: {e}")
         sys.exit(1)
 
-    # 检查 wishlist 文件是否存在
-    wishlist_path = Path(setting['wishlist'])
-    if not wishlist_path.exists():
-        print(f"wishlist 文件不存在: {wishlist_path}")
-        sys.exit(1)
-
-    # 创建保存目录
-    save_path = Path(setting["save_directory"])
-    if not save_path.exists():
-        try:
-            save_path.mkdir(parents=True, exist_ok=True)
-            print(f"已创建保存目录: {save_path}")
-        except Exception as e:
-            print(f"无法创建保存目录 {save_path}: {e}")
-            sys.exit(1)
-
-# 后处理函数
-def postProcess():
-    while not shutdown_event.is_set():
-        try:
-            parameters = processingQueue.get(timeout=1)
-            if parameters is None:
-                break  # 停止线程
-            model = parameters['model']
-            path = parameters['path']
-            filename = os.path.split(path)[-1]
-            directory = os.path.dirname(path)
-            file = os.path.splitext(filename)[0]
-            try:
-                subprocess.run(setting['postProcessingCommand'].split() + [path, filename, directory, model, file, 'cam4'], check=True)
-            except subprocess.CalledProcessError as e:
-                with open('log.log', 'a+') as f:
-                    f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 后处理错误: {e}\n')
-        except queue.Empty:
-            continue
-
-# 模型类，用于处理流媒体的下载和管理
 class Modelo(threading.Thread):
     def __init__(self, modelo):
-        threading.Thread.__init__(self)
-        self.modelo = modelo
+        super().__init__()
+        self.modelo = modelo.strip()
         self._stopevent = threading.Event()
         self.file = None
-        self.online = None
-        self.lock = threading.Lock()
-        self.session = None
+        self.session = requests.Session()
         self.stream = None
 
-    def run(self):
-        global recording, hilos
-        print(f"启动模型线程: {self.modelo}")
-        while not shutdown_event.is_set() and not self._stopevent.is_set():
-            isOnline = self.isOnline()
-            if not isOnline:
-                print(f"模型 {self.modelo} 不在线")
-                self.online = False
-                time.sleep(10)  # 等待一段时间后重新检查
-                continue
-            else:
-                print(f"模型 {self.modelo} 在线，开始录制")
-                model_dir = Path(setting['save_directory']) / self.modelo
-                model_dir.mkdir(parents=True, exist_ok=True)
-                timestamp = datetime.datetime.fromtimestamp(time.time()).strftime("%Y.%m.%d_%H.%M.%S")
-                self.file = model_dir / f'{timestamp}_{self.modelo}.ts'
-                try:
-                    self.session = streamlink.Streamlink()
-                    streams = self.session.streams(f'hlsvariant://{isOnline}')
-                    if 'best' not in streams:
-                        raise ValueError("未找到适合的流。")
-                    self.stream = streams['best']
-                    with self.stream.open() as fd, open(self.file, 'wb') as f:
-                        self.lock.acquire()
-                        recording.append(self)
-                        for index, hilo in enumerate(hilos):
-                            if hilo.modelo == self.modelo:
-                                del hilos[index]
-                                break
-                        self.lock.release()
-                        start_time = time.time()
-                        while not (self._stopevent.is_set() or shutdown_event.is_set() or os.fstat(f.fileno()).st_nlink == 0):
-                            current_time = time.time()
-                            elapsed = current_time - start_time
-                            if elapsed >= 1800:  # 30分钟 = 1800秒
-                                print(f"模型 {self.modelo} 已录制30分钟，正在停止并保存文件。")
-                                break
-                            try:
-                                data = fd.read(1024)
-                                if not data:
-                                    break
-                                f.write(data)
-                            except Exception as e:
-                                with open('log.log', 'a+') as log_file:
-                                    log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 流错误: {e}\n')
-                                break
-                    if setting['postProcessingCommand']:
-                        processingQueue.put({'model': self.modelo, 'path': str(self.file)})
-                except Exception as e:
-                    with open('log.log', 'a+') as f:
-                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 异常: {e}\n')
-                    self.stop()
-                finally:
-                    self.exceptionHandler()
+        # 使用代理（如果配置了且非空）
+        if setting['proxy']:
+            self.session.proxies = {'http': setting['proxy'], 'https': setting['proxy']}
 
-    def exceptionHandler(self):
-        self.stop()
-        self.online = False
-        self.lock.acquire()
-        if self in recording:
-            recording.remove(self)
-        self.lock.release()
-        try:
-            file = Path(self.file)
-            if file.is_file() and file.stat().st_size <= 1024:
-                file.unlink()
-        except Exception as e:
-            with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 异常: {e}\n')
-        finally:
-            # 显式关闭会话，以确保后台任务停止
-            if self.stream:
-                try:
-                    self.stream.close()
-                except Exception as e:
-                    with open('log.log', 'a+') as f:
-                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 流关闭错误: {e}\n')
-            if self.session:
-                try:
-                    self.session.close()
-                except Exception as e:
-                    with open('log.log', 'a+') as f:
-                        f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 会话关闭错误: {e}\n')
-                self.session = None
+    def run(self):
+        print(f"[{self.modelo}] 启动线程")
+        if shutdown_event.is_set():
+            return
+
+        stream_url = self.isOnline()
+        if not stream_url:
+            print(f"[{self.modelo}] 无法获取在线源，结束")
+            return
+
+        print(f"[{self.modelo}] 在线，开始录制")
+        self.recordStream(stream_url)
+        print(f"[{self.modelo}] 录制结束")
 
     def isOnline(self):
+        url = f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/'
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Referer': f'https://chaturbate.com/{self.modelo}/',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+
+        # 尝试多次获取，遇到429时使用指数退避
+        max_attempts = 5
+        base_delay = 300  # 初始等待时间(秒)，5分钟
+        for attempt in range(1, max_attempts + 1):
+            if shutdown_event.is_set():
+                return None
+            try:
+                response = self.session.get(url, headers=headers, verify=certifi.where(), timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    return data.get('hls_source')
+                elif response.status_code == 403:
+                    print(f"[{self.modelo}] 403 错误，等待1分钟再试")
+                    time.sleep(60)
+                elif response.status_code == 429:
+                    # 429：请求过多，使用指数退避
+                    wait_time = base_delay * (2 ** (attempt - 1))
+                    print(f"[{self.modelo}] 429 错误，请求过多，等待 {wait_time} 秒后再试")
+                    time.sleep(wait_time)
+                else:
+                    print(f"[{self.modelo}] 状态码 {response.status_code}，尝试下一个，等待30秒")
+                    time.sleep(30)
+            except requests.exceptions.RequestException as e:
+                print(f"[{self.modelo}] 请求错误: {e}, 等待30秒重试")
+                time.sleep(30)
+        return None
+
+    def recordStream(self, stream_url):
+        model_dir = Path(setting['save_directory']) / self.modelo
+        model_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+        self.file = model_dir / f'{timestamp}_{self.modelo}.ts'
+
         try:
-            # 添加请求头（可选，根据需要）
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)\
-                 Chrome/58.0.3029.110 Safari/537.3'
-            }
+            session = streamlink.Streamlink()
+            # 设置streamlink选项，提高HLS稳定性
+            session.set_option("hls-segment-attempts", 5)
+            session.set_option("hls-segment-timeout", 30)
+            session.set_option("hls-timeout", 120)
+            session.set_option("hls-live-edge", 3)
 
-            # 临时绕过 SSL 验证（不推荐）
-            resp = requests.get(
-                f'https://chaturbate.com/api/chatvideocontext/{self.modelo}/',
-                headers=headers,
-                verify=False  # 添加此参数绕过 SSL 验证
-            )
-            print(f"响应状态码: {resp.status_code}")
-            print(f"响应内容: {resp.text[:200]}")  # 只打印前200个字符
+            streams = session.streams(f'hlsvariant://{stream_url}')
+            if 'best' not in streams:
+                print(f"[{self.modelo}] 未找到合适流")
+                return
 
-            # 尝试解析 JSON
-            data = resp.json()
-            print(f"检查模型 {self.modelo} 的在线状态: {data}")
-            if 'hls_source' in data:
-                return data['hls_source']
-            else:
-                return False
-        except ValueError as ve:
-            # JSON 解析错误
-            with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} JSON 解析错误: {ve}\n')
-            return False
-        except requests.exceptions.SSLError as ssl_err:
-            # SSL 错误
-            with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} SSL 错误: {ssl_err}\n')
-            return False
-        except requests.exceptions.RequestException as req_err:
-            # 其他请求错误
-            with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 请求错误: {req_err}\n')
-            return False
+            with streams['best'].open() as fd, open(self.file, 'wb') as f:
+                print(f"[{self.modelo}] 开始录制 -> {self.file}")
+                for data in fd:
+                    if self._stopevent.is_set() or shutdown_event.is_set():
+                        break
+                    f.write(data)
         except Exception as e:
-            # 其他未预料的错误
-            with open('log.log', 'a+') as f:
-                f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 其他错误: {e}\n')
-            return False
+            print(f"[{self.modelo}] 录制错误: {e}")
 
     def stop(self):
         self._stopevent.set()
-        try:
-            # 停止流会话
-            if self.stream:
-                self.stream.close()
-            if self.session:
-                self.session.close()
-            # 删除小于1KB的残留文件
-            if hasattr(self, 'file') and self.file:
-                if os.path.exists(self.file) and os.path.isfile(self.file):
-                    if os.path.getsize(self.file) <= 1024:
-                        os.remove(self.file)
-        except Exception as e:
-            with open('log.log', 'a+') as log_file:
-                log_file.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 停止错误: {e}\n')
-
-class CleaningThread(threading.Thread):
-    def __init__(self):
-        threading.Thread.__init__(self)
-        self.interval = 0
-        self.lock = threading.Lock()
-
-    def run(self):
-        global hilos, recording
-        while not shutdown_event.is_set():
-            self.lock.acquire()
-            # 只保留活跃的线程
-            hilos = [hilo for hilo in hilos if hilo.is_alive() or hilo.online]
-            self.lock.release()
-            for i in range(10, 0, -1):
-                self.interval = i
-                if shutdown_event.is_set():
-                    break
-                time.sleep(1)
-
-class AddModelsThread(threading.Thread):
-    def __init__(self):
-        threading.Thread.__init__(self)
-        self.wanted = []
-        self.lock = threading.Lock()
-        self.repeatedModels = []
-        self.counterModel = 0
-
-    def run(self):
-        global hilos, recording
-        lines = Path(setting['wishlist']).read_text().splitlines()
-        self.wanted = [x.lower() for x in lines if x]
-        self.lock.acquire()
-        try:
-            aux = []
-            for model in self.wanted:
-                if shutdown_event.is_set():
-                    break
-                if model in aux:
-                    self.repeatedModels.append(model)
-                else:
-                    aux.append(model)
-                    self.counterModel += 1
-                    if not isModelInListofObjects(model, hilos) and not isModelInListofObjects(model, recording):
-                        thread = Modelo(model)
-                        thread.start()
-                        hilos.append(thread)
-            for hilo in recording:
-                if hilo.modelo not in aux:
-                    hilo.stop()
-        finally:
-            self.lock.release()
-
-# 检查模型是否在对象列表中
-def isModelInListofObjects(obj, lista):
-    return any(i.modelo == obj for i in lista)
+        if self.stream:
+            self.stream.close()
+        self.session.close()
 
 if __name__ == '__main__':
     try:
         readConfig()
-        if setting['postProcessingCommand']:
-            processingQueue = queue.Queue()
-            postprocessingWorkers = [threading.Thread(target=postProcess, daemon=True) for _ in range(setting['postProcessingThreads'])]
-            for t in postprocessingWorkers:
-                t.start()
-        cleaningThread = CleaningThread()
-        cleaningThread.start()
-        while not shutdown_event.is_set():
-            readConfig()
-            addModelsThread = AddModelsThread()
-            addModelsThread.start()
-            for i in range(setting['interval'], 0, -1):
-                if shutdown_event.is_set():
-                    break
-                cls()
-                if addModelsThread.repeatedModels:
-                    print('以下模型在愿望列表中出现多次: [' + ', '.join(model for model in addModelsThread.repeatedModels) + ']')
-                print(f'{len(hilos):02d} 个活跃线程（每个非录制模型一个线程），在 {cleaningThread.interval:02d} 秒内清理死线程或非在线线程，愿望列表中有 {addModelsThread.counterModel:02d} 个模型')
-                print(f'在线线程（模型）: {len(recording):02d}')
-                print('以下模型正在被录制:')
-                for hiloModelo in recording:
-                    print(f'  模型: {hiloModelo.modelo}  -->  文件: {os.path.basename(hiloModelo.file)}')
-                print(f'下次检查将在 {i:02d} 秒后进行\r', end='')
-                time.sleep(1)
-            addModelsThread.join()
+        models_queue = [m for m in Path(setting['wishlist']).read_text().splitlines() if m.strip()]
+
+        active_threads = []
+        # 使用配置文件中的 max_concurrent 值来决定同时启动多少个线程
+        for _ in range(min(setting['max_concurrent'], len(models_queue))):
+            model_name = models_queue.pop(0)
+            t = Modelo(model_name)
+            t.start()
+            active_threads.append(t)
+
+        # 当有线程结束后立即启动下一个模型线程，直到队列耗尽
+        while not shutdown_event.is_set() and (active_threads or models_queue):
+            # 检查哪些线程已结束
+            finished = [t for t in active_threads if not t.is_alive()]
+            # 移除结束的线程
+            for t in finished:
+                active_threads.remove(t)
+                # 若有剩余模型，启动下一个
+                if models_queue:
+                    next_model = models_queue.pop(0)
+                    nt = Modelo(next_model)
+                    nt.start()
+                    active_threads.append(nt)
+            time.sleep(5)
     except KeyboardInterrupt:
-        print("\n正在优雅地关闭...")
-        shutdown_event.set()  # 设置全局关闭事件
-
-        # 停止所有 Modelo 线程
-        for hilo in hilos:
-            hilo.stop()
-        for hilo in hilos:
-            hilo.join()
-
-        # 停止 CleaningThread
-        cleaningThread.join()
-
-        # 停止 AddModelsThread 如果它还在运行
-        if 'addModelsThread' in locals() and addModelsThread.is_alive():
-            addModelsThread.join()
-
-        # 停止 post-processing workers
-        if setting.get('postProcessingCommand'):
-            # 发送停止信号
-            for worker in postprocessingWorkers:
-                processingQueue.put(None)
-            for worker in postprocessingWorkers:
-                worker.join()
-
+        print("正在关闭...")
+        shutdown_event.set()
+        for t in active_threads:
+            t.stop()
+            t.join()
         print("所有线程已安全关闭。")
-        sys.exit(0)
-    except Exception as e:
-        with open('log.log', 'a+') as f:
-            f.write(f'\n{datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")} 主循环错误: {e}\n')
